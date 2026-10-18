@@ -1,0 +1,21 @@
+{
+  "name": "link-new-tab",
+  "version": "1.1.0",
+  "description": "Chrome extension for opening links in new tabs and watching videos in Picture-in-Picture.",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "check": "node scripts/check.cjs",
+    "test": "node tests/test-extension.cjs && node tests/test-pip.cjs",
+    "test:links": "node tests/test-extension.cjs",
+    "test:pip": "node tests/test-pip.cjs",
+    "test:youtube": "node tests/test-youtube-pip.cjs",
+    "build": "node scripts/build.cjs",
+    "package:source": "node scripts/package-source.cjs"
+  },
+  "devDependencies": {
+    "fflate": "0.8.3",
+    "playwright": "1.62.1"
+  }
+}

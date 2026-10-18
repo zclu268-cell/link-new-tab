@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>链接新开</title>
+    <link rel="stylesheet" href="popup.css">
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <img class="app-icon" src="icons/icon-48.png" width="44" height="44" alt="">
+        <div>
+          <h1>链接新开</h1>
+          <p id="summary">正在读取设置…</p>
+        </div>
+      </header>
+
+      <section class="settings" aria-label="链接打开设置">
+        <label class="setting" for="enabled">
+          <span class="setting-copy">
+            <span class="setting-title">开启链接新开</span>
+            <span class="setting-description">左键点击普通链接，在新标签页打开；不影响视频小窗</span>
+          </span>
+          <input type="checkbox" role="switch" id="enabled" disabled>
+        </label>
+        <label class="setting" for="active">
+          <span class="setting-copy">
+            <span class="setting-title">切换到新标签页</span>
+            <span class="setting-description">关闭后，新标签页在后台打开</span>
+          </span>
+          <input type="checkbox" role="switch" id="active" disabled>
+        </label>
+      </section>
+
+      <section class="site-card" aria-labelledby="site-title">
+        <p class="eyebrow" id="site-title">当前网站</p>
+        <p id="site-name" class="site-name">正在获取…</p>
+        <label class="setting site-setting" for="site-enabled">
+          <span class="setting-title">在此网站启用</span>
+          <input type="checkbox" role="switch" id="site-enabled" aria-describedby="site-help" disabled>
+        </label>
+        <p id="site-help" class="site-help">只控制当前域名的链接新开，子域名分别设置。</p>
+      </section>
+
+      <section class="video-card" aria-labelledby="video-title">
+        <h2 id="video-title">视频小窗</h2>
+        <p class="video-description">播放 YouTube 等网页视频后，点击视频上的「小窗播放」，可边看视频边使用其他窗口。</p>
+        <button id="show-video-controls" type="button" disabled>显示视频小窗按钮</button>
+        <p id="video-feedback" class="video-feedback" role="status" aria-live="polite">视频小窗独立于上面的链接设置。</p>
+      </section>
+
+      <p class="tip">首次安装或更新后，请刷新已打开的网页。</p>
+      <p class="fine-print">Ctrl / ⌘、Shift、Alt 点击和鼠标中键保持原有行为。</p>
+      <p id="feedback" class="feedback" role="status" aria-live="polite"></p>
+      <p id="error" class="error" role="alert" hidden></p>
+    </main>
+  </body>
+</html>
