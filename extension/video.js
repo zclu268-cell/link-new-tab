@@ -1,9 +1,11 @@
 (() => {
   // Independent from link handling: turning links off must not close a video.
   const videos = new Set();
-  const watched = new WeakSet();
+  const visibleVideos = new Set();
+  const playingVideos = new Set();
   const pendingRoots = new Set();
   const observedSizes = new Set();
+  const mediaEvents = ['play', 'pause', 'ended', 'loadedmetadata', 'loadeddata', 'emptied', 'resize', 'enterpictureinpicture', 'leavepictureinpicture'];
   let layoutNodes = new Set();
   let selected = null;
   let host, button, status, panel;
@@ -12,8 +14,68 @@
   let lastRefresh = 0;
   let layoutListening = false;
   let attributesListening = false;
+  let needsPrune = false;
+  let disposed = false;
+  let suspended = false;
   const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(scheduleRefresh) : null;
   const attributeObserver = new MutationObserver(scheduleRefresh);
+  const intersectionObserver = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
+    if (!isActive() || suspended || document.hidden) return;
+    for (const entry of entries) {
+      if (!videos.has(entry.target)) continue;
+      if (entry.isIntersecting) visibleVideos.add(entry.target);
+      else visibleVideos.delete(entry.target);
+    }
+    scheduleRefresh();
+  }) : null;
+
+  function isActive() {
+    if (disposed) return false;
+    try { if (chrome.runtime?.id) return true; } catch { /* Invalidated extension world. */ }
+    dispose();
+    return false;
+  }
+
+  function suspend() {
+    suspended = true;
+    observer.disconnect();
+    attributeObserver.disconnect();
+    attributesListening = false;
+    resizeObserver?.disconnect();
+    intersectionObserver?.disconnect();
+    observedSizes.clear();
+    visibleVideos.clear();
+    window.removeEventListener('resize', scheduleRefresh);
+    window.removeEventListener('scroll', scheduleRefresh, true);
+    document.removeEventListener('fullscreenchange', scheduleRefresh);
+    layoutListening = false;
+    clearTimeout(discoveryTimer);
+    clearTimeout(refreshTimer);
+    cancelAnimationFrame(refreshFrame);
+    cancelAnimationFrame(positionFrame);
+    discoveryTimer = refreshTimer = refreshFrame = positionFrame = null;
+    pendingRoots.clear();
+    needsPrune = false;
+  }
+
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    suspend();
+    clearTimeout(highlightTimer);
+    for (const video of videos) untrackVideo(video);
+    layoutNodes.clear();
+    playingVideos.clear();
+    document.removeEventListener('visibilitychange', updateVisibility);
+    window.removeEventListener('focus', onFocus);
+    window.removeEventListener('pagehide', onPageHide);
+    window.removeEventListener('pageshow', onPageShow);
+    try { chrome.runtime.onMessage.removeListener(onMessage); } catch { /* Already invalidated. */ }
+    button?.removeEventListener('click', togglePictureInPicture);
+    host?.remove();
+    selected = host = button = status = panel = null;
+    // Removing our controls must not interrupt native playback or Picture-in-Picture.
+  }
 
   const messages = {
     'no-video': '当前页面没有找到视频，请先打开并播放一个视频。',
@@ -43,15 +105,26 @@
       Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
   }
 
-  function chooseVideo() {
+  function chooseVideo(forceScan = false) {
     if (document.pictureInPictureElement instanceof HTMLVideoElement) return document.pictureInPictureElement;
-    const candidates = [...videos].filter(video => video.isConnected).map(video => ({
-      video, area: visibleArea(video), playing: !video.paused && !video.ended && video.readyState >= 2
-    })).filter(item => item.area > 0 || item.playing);
-    const visible = candidates.filter(item => item.area > 0);
-    const pool = visible.length ? visible : candidates;
-    pool.sort((a, b) => Number(b.playing) - Number(a.playing) || b.area - a.area);
-    return pool[0]?.video || null;
+    let best = null, bestArea = 0, bestPlaying = false;
+    // The browser maintains viewport membership; off-screen feeds need no
+    // synchronous layout reads on each scroll. Explicit popup requests can scan.
+    const candidates = forceScan || !intersectionObserver ? videos : visibleVideos;
+    for (const video of candidates) {
+      if (!video.isConnected) continue;
+      const area = visibleArea(video);
+      if (!area) continue;
+      const playing = playingVideos.has(video);
+      if (!best || (playing && !bestPlaying) || (playing === bestPlaying && area > bestArea)) {
+        best = video;
+        bestArea = area;
+        bestPlaying = playing;
+      }
+    }
+    if (best) return best;
+    for (const video of playingVideos) if (video.isConnected) return video;
+    return null;
   }
 
   function setStatus(text = '') {
@@ -98,7 +171,7 @@
 
   function positionControls() {
     positionFrame = null;
-    if (document.hidden || !host || !selected) return;
+    if (!isActive() || suspended || document.hidden || !host || !selected) return;
     const r = selected.getBoundingClientRect();
     const onScreen = visibleArea(selected, r) > 0;
     const panelRect = panel.getBoundingClientRect();
@@ -113,16 +186,16 @@
   }
 
   function schedulePosition() {
-    if (!document.hidden && !positionFrame) positionFrame = requestAnimationFrame(positionControls);
+    if (isActive() && !suspended && !document.hidden && !positionFrame) positionFrame = requestAnimationFrame(positionControls);
   }
 
   function scheduleRefresh() {
-    if (document.hidden || (!videos.size && !selected) || refreshFrame || refreshTimer) return;
+    if (!isActive() || suspended || document.hidden || (!videos.size && !selected) || refreshFrame || refreshTimer) return;
     // Scrolling and player animations can emit many events in one frame. Keep
     // video selection at most ten times per second, without a polling loop.
     const enqueue = () => {
       refreshTimer = null;
-      if (document.hidden) return;
+      if (!isActive() || suspended || document.hidden) return;
       refreshFrame = requestAnimationFrame(() => {
         refreshFrame = null;
         refresh();
@@ -133,10 +206,10 @@
     else enqueue();
   }
 
-  function refresh() {
-    if (document.hidden) return;
+  function refresh(forceScan = false) {
+    if (!isActive() || suspended || document.hidden) return;
     lastRefresh = performance.now();
-    const next = busy ? selected : chooseVideo();
+    const next = busy ? selected : chooseVideo(forceScan);
     if (!next) {
       selected = null;
       if (host) host.style.setProperty('display', 'none', 'important');
@@ -160,6 +233,7 @@
   }
 
   async function togglePictureInPicture(event) {
+    if (!isActive()) return;
     event.preventDefault();
     event.stopPropagation();
     if (!event.isTrusted || busy) return;
@@ -178,17 +252,20 @@
       if (exiting) await document.exitPictureInPicture();
       else await video.requestPictureInPicture();
     } catch (error) {
+      if (!isActive()) return;
       const failure = error.name === 'NotAllowedError' ? 'gesture' :
         error.name === 'SecurityError' ? 'policy' :
         error.name === 'NotSupportedError' ? 'not-supported' : reason(video) || 'failed';
       setStatus(messages[failure]);
     } finally {
       busy = false;
-      refresh();
+      if (isActive()) refresh();
     }
   }
 
   function onVideoEvent(event) {
+    if (!isActive()) return;
+    updatePlaying(event.currentTarget);
     if (event.type === 'leavepictureinpicture') setStatus();
     scheduleRefresh();
   }
@@ -196,13 +273,25 @@
   function trackVideo(video) {
     if (videos.has(video)) return false;
     videos.add(video);
-    if (!watched.has(video)) {
-      watched.add(video);
-      for (const name of ['play', 'pause', 'ended', 'loadedmetadata', 'loadeddata', 'emptied', 'resize', 'enterpictureinpicture', 'leavepictureinpicture']) {
-        video.addEventListener(name, onVideoEvent);
-      }
-    }
+    for (const name of mediaEvents) video.addEventListener(name, onVideoEvent);
+    updatePlaying(video);
+    if (!suspended && !document.hidden) intersectionObserver?.observe(video);
     return true;
+  }
+
+  function updatePlaying(video) {
+    if (!video.paused && !video.ended && video.readyState >= 2) playingVideos.add(video);
+    else playingVideos.delete(video);
+  }
+
+  function untrackVideo(video) {
+    for (const name of mediaEvents) video.removeEventListener(name, onVideoEvent);
+    resizeObserver?.unobserve(video);
+    intersectionObserver?.unobserve(video);
+    observedSizes.delete(video);
+    visibleVideos.delete(video);
+    playingVideos.delete(video);
+    videos.delete(video);
   }
 
   function sameNodes(a, b) {
@@ -216,7 +305,7 @@
     }
     const changed = !sameNodes(layoutNodes, nextLayoutNodes);
     layoutNodes = nextLayoutNodes;
-    if (document.hidden) return changed;
+    if (suspended || document.hidden) return changed;
 
     // Observe styles only on videos and their ancestors. A page-wide attribute
     // observer would wake up for unrelated animations and application updates.
@@ -257,7 +346,7 @@
     let changed = false;
     for (const video of videos) {
       if (!video.isConnected) {
-        videos.delete(video);
+        untrackVideo(video);
         changed = true;
       }
     }
@@ -266,8 +355,10 @@
 
   function discoverAddedVideos() {
     discoveryTimer = null;
-    if (document.hidden) return;
-    let changed = pruneVideos();
+    if (!isActive() || suspended || document.hidden) return;
+    let changed = needsPrune && pruneVideos();
+    needsPrune = false;
+    let ancestryChanged = false;
     for (const root of pendingRoots) {
       if (!root.isConnected) continue;
       // The parser/framework may report both a new parent and its children.
@@ -277,15 +368,22 @@
         if (pendingRoots.has(parent)) { covered = true; break; }
       }
       if (covered) continue;
-      if (root instanceof HTMLVideoElement) changed = trackVideo(root) || changed;
-      for (const video of root.querySelectorAll('video')) changed = trackVideo(video) || changed;
+      if (root instanceof HTMLVideoElement) {
+        changed = trackVideo(root) || changed;
+        ancestryChanged = true;
+      }
+      for (const video of root.querySelectorAll('video')) {
+        changed = trackVideo(video) || changed;
+        ancestryChanged = true;
+      }
     }
     pendingRoots.clear();
-    const layoutChanged = syncLayoutTracking();
+    const layoutChanged = (changed || ancestryChanged) && syncLayoutTracking();
     if (changed || layoutChanged) scheduleRefresh();
   }
 
   function onMutations(records) {
+    if (!isActive() || suspended || document.hidden) return;
     let needsDiscovery = false;
     let layoutChanged = false;
     for (const record of records) {
@@ -296,28 +394,36 @@
           needsDiscovery = true;
         }
       }
-      if (videos.size && [...record.removedNodes].some(node => node !== host && node.nodeType === Node.ELEMENT_NODE)) needsDiscovery = true;
+      // A removed video or one of its known ancestors requires reconciliation.
+      // Removing an unrelated feed item must not walk every video's ancestors.
+      if (videos.size && [...record.removedNodes].some(node => layoutNodes.has(node))) {
+        needsPrune = true;
+        needsDiscovery = true;
+      }
       if (layoutNodes.has(record.target) && [...record.addedNodes, ...record.removedNodes].some(node => node !== host)) layoutChanged = true;
     }
     if (needsDiscovery && !discoveryTimer) discoveryTimer = setTimeout(discoverAddedVideos, 120);
     if (layoutChanged) scheduleRefresh();
   }
 
-  function synchronizeVideos() {
+  function synchronizeVideos(forceScan = false) {
+    if (!isActive() || suspended || document.hidden) return;
     clearTimeout(discoveryTimer);
     discoveryTimer = null;
     pendingRoots.clear();
+    needsPrune = false;
     pruneVideos();
     // A full search is only needed on startup, returning to a hidden tab, or
     // an explicit request from the extension popup.
     for (const video of document.querySelectorAll('video')) trackVideo(video);
     syncLayoutTracking();
-    refresh();
+    refresh(forceScan);
   }
 
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  function onMessage(message, sender, sendResponse) {
+    if (!isActive()) return false;
     if (sender.id !== chrome.runtime.id || message?.type !== 'PIP_SHOW_CONTROLS') return false;
-    synchronizeVideos();
+    synchronizeVideos(true);
     const blocked = reason(selected);
     const result = { ok: !blocked, count: videos.size, reason: blocked };
     if (host && selected) {
@@ -325,7 +431,12 @@
       panel.classList.add('highlight');
       setStatus(blocked ? messages[blocked] : '点击上方“小窗播放”，视频会在独立窗口中播放。');
       schedulePosition();
-      highlightTimer = setTimeout(() => { panel.classList.remove('highlight'); setStatus(); schedulePosition(); }, 8000);
+      highlightTimer = setTimeout(() => {
+        if (!isActive()) return;
+        panel.classList.remove('highlight');
+        setStatus();
+        schedulePosition();
+      }, 8000);
     }
     sendResponse(result);
     // Popup aggregates all frames, so an empty top frame cannot mask an embedded video.
@@ -333,33 +444,39 @@
       chrome.runtime.sendMessage({ type: 'PIP_CONTROL_RESULT', requestId: message.requestId, result }).catch(() => {});
     }
     return false;
-  });
+  }
+  chrome.runtime.onMessage.addListener(onMessage);
 
   const observer = new MutationObserver(onMutations);
   function updateVisibility() {
+    if (!isActive()) return;
     if (!document.hidden) {
+      suspended = false;
       observer.observe(document, { childList: true, subtree: true });
+      for (const video of videos) {
+        updatePlaying(video);
+        intersectionObserver?.observe(video);
+      }
       synchronizeVideos();
       return;
     }
     // Keep native media/PiP event listeners, but pause discovery and all layout
     // work for background tabs. Resume with one reconciliation when visible.
-    observer.disconnect();
-    attributeObserver.disconnect();
-    attributesListening = false;
-    resizeObserver?.disconnect();
-    observedSizes.clear();
-    window.removeEventListener('resize', scheduleRefresh);
-    window.removeEventListener('scroll', scheduleRefresh, true);
-    document.removeEventListener('fullscreenchange', scheduleRefresh);
-    layoutListening = false;
-    clearTimeout(discoveryTimer);
-    clearTimeout(refreshTimer);
-    cancelAnimationFrame(refreshFrame);
-    cancelAnimationFrame(positionFrame);
-    discoveryTimer = refreshTimer = refreshFrame = positionFrame = null;
-    pendingRoots.clear();
+    suspend();
+  }
+  function onFocus() { isActive(); }
+  function onPageHide(event) {
+    if (!isActive()) return;
+    if (event.persisted) suspend();
+    else dispose();
+  }
+  function onPageShow(event) {
+    if (!isActive()) return;
+    if (event.persisted) updateVisibility();
   }
   document.addEventListener('visibilitychange', updateVisibility);
+  window.addEventListener('focus', onFocus);
+  window.addEventListener('pagehide', onPageHide);
+  window.addEventListener('pageshow', onPageShow);
   updateVisibility();
 })();

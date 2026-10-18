@@ -58,8 +58,12 @@ async function instrument(page, extensionId) {
     return response.result.value;
   };
   await evaluate(`(() => {
-    const counts = { documentVideoQueries:0, subtreeVideoQueries:0, videoRectReads:0, videoStyleReads:0, documentQueryMs:0 };
+    const counts = {
+      documentVideoQueries:0, subtreeVideoQueries:0, videoRectReads:0, offscreenVideoRectReads:0,
+      videoStyleReads:0, videoParentReads:0, videoConnectionReads:0, parentElementReads:0, documentQueryMs:0
+    };
     globalThis.__linkNewTabPerformance = counts;
+    globalThis.__linkNewTabLastMeasuredVideo = '';
     const documentQuery = Document.prototype.querySelectorAll;
     Document.prototype.querySelectorAll = function(selector) {
       if (selector !== 'video') return Reflect.apply(documentQuery, this, arguments);
@@ -75,18 +79,36 @@ async function instrument(page, extensionId) {
     };
     const rect = Element.prototype.getBoundingClientRect;
     Element.prototype.getBoundingClientRect = function() {
-      if (this instanceof HTMLVideoElement) counts.videoRectReads++;
-      return Reflect.apply(rect, this, arguments);
+      const value = Reflect.apply(rect, this, arguments);
+      if (this instanceof HTMLVideoElement) {
+        counts.videoRectReads++;
+        globalThis.__linkNewTabLastMeasuredVideo = this.id;
+        if (value.bottom <= 0 || value.top >= innerHeight || value.right <= 0 || value.left >= innerWidth) counts.offscreenVideoRectReads++;
+      }
+      return value;
     };
     const computedStyle = globalThis.getComputedStyle;
     globalThis.getComputedStyle = function(element) {
       if (element instanceof HTMLVideoElement) counts.videoStyleReads++;
       return Reflect.apply(computedStyle, this, arguments);
     };
+    // Video parent reads expose rebuilding every tracked video's ancestor chain
+    // even when no layout method is called. Preserve the native getter exactly.
+    const parent = Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement');
+    Object.defineProperty(Node.prototype, 'parentElement', { ...parent, get() {
+      counts.parentElementReads++;
+      if (this instanceof HTMLVideoElement) counts.videoParentReads++;
+      return Reflect.apply(parent.get, this, []);
+    } });
+    const connected = Object.getOwnPropertyDescriptor(Node.prototype, 'isConnected');
+    Object.defineProperty(Node.prototype, 'isConnected', { ...connected, get() {
+      if (this instanceof HTMLVideoElement) counts.videoConnectionReads++;
+      return Reflect.apply(connected.get, this, []);
+    } });
   })()`);
   return {
-    read: () => evaluate('({...globalThis.__linkNewTabPerformance})'),
-    reset: () => evaluate('Object.keys(globalThis.__linkNewTabPerformance).forEach(key => globalThis.__linkNewTabPerformance[key] = 0)'),
+    read: () => evaluate('({...globalThis.__linkNewTabPerformance, lastMeasuredVideo:globalThis.__linkNewTabLastMeasuredVideo})'),
+    reset: () => evaluate("Object.keys(globalThis.__linkNewTabPerformance).forEach(key => globalThis.__linkNewTabPerformance[key] = 0); globalThis.__linkNewTabLastMeasuredVideo = ''"),
   };
 }
 
@@ -115,6 +137,15 @@ async function churn(page, kind = 'children') {
           const row = document.createElement('span');
           row.textContent = round + ':' + index;
           fragment.append(row);
+        }
+        area.replaceChildren(fragment);
+      } else if (kind === 'nested') {
+        const fragment = document.createDocumentFragment();
+        for (let index = 0; index < 15; index++) {
+          const component = document.createElement('article');
+          component.innerHTML = '<header><span>Title</span></header><div><p><b>Content</b></p><button>Action</button></div>';
+          component.dataset.tick = round + ':' + index;
+          fragment.append(component);
         }
         area.replaceChildren(fragment);
       } else {
@@ -200,6 +231,42 @@ async function churn(page, kind = 'children') {
       assert.equal(stats.videoStyleReads, 0);
     }
   });
+  await test('嵌套无视频组件替换只检查新增子树，不重建已有视频祖先追踪', async () => {
+    const stats = await collect(counter, 'nestedComponentReplacement', () => churn(page, 'nested'));
+    if (!baselineFile) {
+      assert.equal(stats.documentVideoQueries, 0);
+      assert.equal(stats.videoRectReads, 0);
+      assert.equal(stats.videoStyleReads, 0);
+      assert.equal(stats.videoParentReads, 0, 'Unrelated nested components must not rebuild the existing video ancestor chain');
+      assert(stats.subtreeVideoQueries <= rounds * 15, 'Each newly inserted outer component should be searched at most once');
+    }
+  });
+  await test('纯无关节点移除不重建视频祖先追踪或重新读取视频布局', async () => {
+    await page.evaluate(() => {
+      const area = document.getElementById('churn');
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 120; index++) {
+        const component = document.createElement('section');
+        component.innerHTML = '<p><span>Removable content</span></p>';
+        fragment.append(component);
+      }
+      area.replaceChildren(fragment);
+    });
+    await delay(700);
+    const stats = await collect(counter, 'unrelatedSubtreeRemoval', () => page.evaluate(async rounds => {
+      const area = document.getElementById('churn');
+      for (let round = 0; round < rounds; round++) {
+        for (let index = 0; index < 10; index++) area.firstElementChild.remove();
+        await new Promise(resolve => setTimeout(resolve, 220));
+      }
+    }, rounds));
+    if (!baselineFile) {
+      assert.equal(stats.documentVideoQueries, 0);
+      assert.equal(stats.subtreeVideoQueries, 0, 'Removing unrelated nodes does not require video discovery');
+      assert.equal(stats.videoParentReads, 0, 'Unrelated removal must not rebuild video ancestor tracking');
+      assert.equal(stats.videoRectReads, 0);
+    }
+  });
   await test('多个视频持续滚动时布局读取有界，停止滚动后不持续刷新', async () => {
     await page.evaluate(() => {
       for (let index = 0; index < 2; index++) {
@@ -232,10 +299,58 @@ async function churn(page, kind = 'children') {
     assert.equal(stats.videoRectReads, 0);
     assert.equal(stats.videoStyleReads, 0);
   });
+  await test('长列表滚动只测量可见候选，按钮跟随当前可见视频', async () => {
+    const videoCount = 120;
+    const positions = [7, 0, 23, 65, 117, 4, 91, 37, 115, 58, 16, 106];
+    await page.evaluate(count => {
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < count; index++) {
+        const row = document.createElement('section');
+        row.style.height = '900px';
+        const video = document.createElement('video');
+        video.id = 'long-video-' + index;
+        row.append(video);
+        fragment.append(row);
+      }
+      document.getElementById('player').replaceChildren(fragment);
+      window.scrollTo(0, 0);
+    }, videoCount);
+    await delay(900);
+    const stats = await collect(counter, 'longVideoListScroll', async () => {
+      for (const index of positions) {
+        await page.evaluate(index => window.scrollTo(0, index * 900), index);
+        // The last isolated-world rectangle read must belong to the selected
+        // on-screen video, preventing a cheap-but-stale overlay from passing.
+        const deadline = Date.now() + 5000;
+        let phase;
+        do {
+          await delay(40);
+          phase = await counter.read();
+        } while (phase.lastMeasuredVideo !== 'long-video-' + index && Date.now() < deadline);
+        assert.equal(phase.lastMeasuredVideo, 'long-video-' + index, 'The overlay must follow the visible candidate after scrolling');
+        await page.waitForFunction(id => {
+          const video = document.getElementById(id);
+          const host = document.querySelector('link-new-tab-video-tools');
+          if (!host || getComputedStyle(host).display === 'none') return false;
+          const videoRect = video.getBoundingClientRect();
+          return videoRect.top >= 0 && videoRect.bottom <= innerHeight && Math.abs(host.getBoundingClientRect().top - videoRect.top - 12) < 2;
+        }, 'long-video-' + index, { timeout:5000 });
+      }
+    });
+    if (!baselineFile) {
+      assert.equal(stats.documentVideoQueries, 0);
+      // One viewport contains at most one full video. Twelve reads per step
+      // allow stale observer entries and multiple settling frames, while still
+      // rejecting remeasurement of all 120 tracked videos on every scroll.
+      assert(stats.videoRectReads <= positions.length * 12, 'Offscreen paused videos must not be measured on every scroll');
+      assert(stats.offscreenVideoRectReads <= positions.length * 4, 'Only a few stale viewport candidates may require an offscreen check');
+      assert(stats.videoStyleReads <= positions.length * 12);
+    }
+  });
 
   const summary = report(results, browserVersion, '内容脚本性能回归',
-    '通过 CDP 在真实扩展的 isolated world 包装原生 DOM 方法，记录全页视频查询与视频布局读取次数。' +
-    '固定尺寸容器在 12000 个静态节点旁进行 12 轮动态更新；断言操作次数，不用不稳定的墙钟耗时作为通过标准。' +
+    '通过 CDP 在真实扩展的 isolated world 包装原生 DOM 方法与 getter，记录视频查询、布局读取及祖先读取次数。' +
+    '固定尺寸容器在 12000 个静态节点旁进行 12 轮动态更新，并覆盖嵌套组件替换、无关子树移除和 120 个视频的长列表滚动；断言操作次数，不用不稳定的墙钟耗时作为通过标准。' +
     '这验证本地可重复的性能回归，不代表所有真实网站的加载加速比。' +
     (baselineFile ? ' 本次为旧版采样，性能阈值不作为失败条件。' : ''));
   run.writeJson(mode + '.json', { ...summary.json, mode, rounds, staticNodes:12000, measurements });

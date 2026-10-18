@@ -174,6 +174,26 @@ async function test(name, run) {
     await page.locator('#videos').evaluate(wrapper => { wrapper.style.display='block'; });
     await enter(page);
   });
+  await test('初始隐藏的暂停视频：显示后出现入口并进入画中画', async () => {
+    const page = await fixture(); await addVideo(page,{hidden:true,paused:true});
+    assert.equal(await page.locator(buttonSelector).isVisible(),false);
+    await page.locator('#video').evaluate(video => { video.style.display='block'; });
+    await enter(page);
+    assert.equal(await page.locator('#video').evaluate(video => video.paused),true);
+  });
+  await test('同批次移动播放器容器：跟踪新祖先样式并恢复入口', async () => {
+    const page = await fixture(); await addVideo(page,{paused:true});
+    await page.evaluate(() => {
+      const wrapper = document.createElement('section'); wrapper.id='moved-player';
+      document.body.append(wrapper);
+      wrapper.append(document.querySelector('#video'));
+    });
+    await delay(300);
+    await page.locator('#moved-player').evaluate(wrapper => { wrapper.style.display='none'; });
+    await page.locator(buttonSelector).waitFor({state:'hidden'});
+    await page.locator('#moved-player').evaluate(wrapper => { wrapper.style.display='block'; });
+    await enter(page);
+  });
   await test('模拟后台可见性状态：恢复后发现替换播放器并进入真实画中画', async () => {
     const page = await fixture(); await addVideo(page,{id:'before-hidden',paused:true});
     await fixtureHiddenState(page,true);
