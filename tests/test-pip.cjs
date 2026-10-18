@@ -70,6 +70,28 @@ async function addVideo(page, options = {}) {
   await delay(350);
 }
 async function pipId(page) { return page.evaluate(() => document.pictureInPictureElement?.id ?? null); }
+async function fixtureHiddenState(page, hidden) {
+  // Headless Chromium keeps its tabs visible. Simulate only the visibility
+  // input in the extension world; native video and PiP APIs remain unchanged.
+  const session = await context.newCDPSession(page);
+  const worlds = [];
+  session.on('Runtime.executionContextCreated', ({context: world}) => worlds.push(world));
+  try {
+    await session.send('Runtime.enable');
+    for (const world of worlds) {
+      if (world.auxData?.isDefault) continue;
+      const probe = await session.send('Runtime.evaluate', {contextId:world.id,expression:'globalThis.chrome?.runtime?.id',returnByValue:true});
+      if (probe.result.value !== new URL(worker.url()).host) continue;
+      const expression = hidden
+        ? "Object.defineProperty(document, 'hidden', {configurable:true,value:true}); document.dispatchEvent(new Event('visibilitychange'));"
+        : "delete document.hidden; document.dispatchEvent(new Event('visibilitychange'));";
+      const result = await session.send('Runtime.evaluate', {contextId:world.id,expression});
+      assert(!result.exceptionDetails,'Unable to simulate fixture visibility');
+      return;
+    }
+    throw Error('Extension isolated world not found');
+  } finally { await session.detach(); }
+}
 async function enter(page, expected = 'video') {
   await page.locator(buttonSelector).waitFor({ state:'visible', timeout:5000 });
   await page.locator(buttonSelector).click();
@@ -130,6 +152,35 @@ async function test(name, run) {
   });
   await test('动态插入视频：无刷新即可发现并进入画中画', async () => {
     const page = await fixture(); await delay(400); await addVideo(page,{id:'dynamic'}); await enter(page,'dynamic');
+  });
+  await test('同一个视频移除再插回：恢复发现、尺寸跟随和画中画', async () => {
+    const page = await fixture(); await addVideo(page,{id:'reused'}); await enter(page,'reused'); await leave(page);
+    await page.evaluate(() => { window.savedVideo = document.querySelector('#reused'); savedVideo.remove(); });
+    await page.locator(buttonSelector).waitFor({state:'hidden'});
+    await page.evaluate(() => { document.querySelector('#videos').append(savedVideo); savedVideo.style.width='400px'; savedVideo.style.height='225px'; });
+    await page.locator(buttonSelector).waitFor({state:'visible'});
+    await page.waitForFunction(() => {
+      const video = document.querySelector('#reused').getBoundingClientRect();
+      const button = document.querySelector('link-new-tab-video-tools').shadowRoot.querySelector('button').getBoundingClientRect();
+      return Math.abs(button.right - video.right + 12) < 2;
+    });
+    await enter(page,'reused');
+  });
+  await test('播放器祖先样式隐藏再显示：恢复暂停视频的入口', async () => {
+    const page = await fixture(); await addVideo(page,{paused:true});
+    await page.locator(buttonSelector).waitFor({state:'visible'});
+    await page.locator('#videos').evaluate(wrapper => { wrapper.style.display='none'; });
+    await page.locator(buttonSelector).waitFor({state:'hidden'});
+    await page.locator('#videos').evaluate(wrapper => { wrapper.style.display='block'; });
+    await enter(page);
+  });
+  await test('模拟后台可见性状态：恢复后发现替换播放器并进入真实画中画', async () => {
+    const page = await fixture(); await addVideo(page,{id:'before-hidden',paused:true});
+    await fixtureHiddenState(page,true);
+    await page.evaluate(() => document.querySelector('#before-hidden').remove());
+    await addVideo(page,{id:'after-hidden',paused:true});
+    await fixtureHiddenState(page,false);
+    await enter(page,'after-hidden');
   });
   await test('SPA 视频更换：退出后删除旧视频并换路由，选中新视频', async () => {
     const page = await fixture(); await addVideo(page,{id:'old'}); await enter(page,'old'); await leave(page);
@@ -239,6 +290,7 @@ async function test(name, run) {
   const { passed, json, markdown } = report(results, browserVersion, '视频画中画：实际浏览器验收结果',
     '视频源：仅监听本机 127.0.0.1 的 HTTP 页面上的 canvas.captureStream() 实时视频，无外部网络视频依赖。使用真实点击，验证 document.pictureInPictureElement 与进入/退出事件；未替换 requestPictureInPicture。\n\n' +
     'headless 验收确认浏览器画中画 API 与扩展交互工作正常，不代表已目视确认桌面悬浮窗。跨域 iframe 使用 127.0.0.1 与 localhost 两个主机名。显示入口消息通过扩展 service worker 发送；真实工具栏弹出面板的 activeTab 授权流程未在此脚本验收。\n\n' +
+    '后台恢复一项在扩展隔离环境模拟 document.hidden 与 visibilitychange，以验证暂停与恢复调度；headless 不能代表实际桌面标签切换，画中画 API 仍为真实调用。\n\n' +
     '未验证：YouTube 实时网站、所有第三方播放器、浏览器内置 PDF/Chrome 内部页面、操作系统窗口置顶表现、用户日常 Chrome 的实际安装。');
   run.writeText('report.md', markdown);
   run.writeJson('report.json', json);

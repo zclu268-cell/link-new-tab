@@ -1,12 +1,19 @@
 (() => {
   // Independent from link handling: turning links off must not close a video.
-  let videos = [];
+  const videos = new Set();
   const watched = new WeakSet();
+  const pendingRoots = new Set();
+  const observedSizes = new Set();
+  let layoutNodes = new Set();
   let selected = null;
   let host, button, status, panel;
   let busy = false;
-  let scanTimer, positionFrame, refreshFrame, highlightTimer;
+  let discoveryTimer, positionFrame, refreshFrame, refreshTimer, highlightTimer;
+  let lastRefresh = 0;
+  let layoutListening = false;
+  let attributesListening = false;
   const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(scheduleRefresh) : null;
+  const attributeObserver = new MutationObserver(scheduleRefresh);
 
   const messages = {
     'no-video': '当前页面没有找到视频，请先打开并播放一个视频。',
@@ -29,8 +36,7 @@
     return null;
   }
 
-  function visibleArea(video) {
-    const r = video.getBoundingClientRect();
+  function visibleArea(video, r = video.getBoundingClientRect()) {
     const style = getComputedStyle(video);
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return 0;
     return Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) *
@@ -39,7 +45,7 @@
 
   function chooseVideo() {
     if (document.pictureInPictureElement instanceof HTMLVideoElement) return document.pictureInPictureElement;
-    const candidates = videos.filter(video => video.isConnected).map(video => ({
+    const candidates = [...videos].filter(video => video.isConnected).map(video => ({
       video, area: visibleArea(video), playing: !video.paused && !video.ended && video.readyState >= 2
     })).filter(item => item.area > 0 || item.playing);
     const visible = candidates.filter(item => item.area > 0);
@@ -50,7 +56,7 @@
 
   function setStatus(text = '') {
     if (!status) return;
-    status.textContent = text;
+    if (status.textContent !== text) status.textContent = text;
     status.hidden = !text;
   }
 
@@ -92,30 +98,44 @@
 
   function positionControls() {
     positionFrame = null;
-    if (!host || !selected) return;
+    if (document.hidden || !host || !selected) return;
     const r = selected.getBoundingClientRect();
-    const onScreen = visibleArea(selected) > 0;
+    const onScreen = visibleArea(selected, r) > 0;
     const panelRect = panel.getBoundingClientRect();
     const width = panelRect.width || 120;
     const height = panelRect.height || 36;
     const x = onScreen ? r.right - width - 12 : innerWidth - width - 20;
     const y = onScreen ? r.top + 12 : innerHeight - height - 20;
-    host.style.setProperty('left', `${Math.max(8, Math.min(x, innerWidth - width - 8))}px`, 'important');
-    host.style.setProperty('top', `${Math.max(8, Math.min(y, innerHeight - height - 8))}px`, 'important');
+    const left = `${Math.max(8, Math.min(x, innerWidth - width - 8))}px`;
+    const top = `${Math.max(8, Math.min(y, innerHeight - height - 8))}px`;
+    if (host.style.left !== left) host.style.setProperty('left', left, 'important');
+    if (host.style.top !== top) host.style.setProperty('top', top, 'important');
   }
 
   function schedulePosition() {
-    if (!positionFrame) positionFrame = requestAnimationFrame(positionControls);
+    if (!document.hidden && !positionFrame) positionFrame = requestAnimationFrame(positionControls);
   }
 
   function scheduleRefresh() {
-    if (!refreshFrame) refreshFrame = requestAnimationFrame(() => {
-      refreshFrame = null;
-      refresh();
-    });
+    if (document.hidden || (!videos.size && !selected) || refreshFrame || refreshTimer) return;
+    // Scrolling and player animations can emit many events in one frame. Keep
+    // video selection at most ten times per second, without a polling loop.
+    const enqueue = () => {
+      refreshTimer = null;
+      if (document.hidden) return;
+      refreshFrame = requestAnimationFrame(() => {
+        refreshFrame = null;
+        refresh();
+      });
+    };
+    const wait = Math.max(0, 100 - (performance.now() - lastRefresh));
+    if (wait) refreshTimer = setTimeout(enqueue, wait);
+    else enqueue();
   }
 
   function refresh() {
+    if (document.hidden) return;
+    lastRefresh = performance.now();
     const next = busy ? selected : chooseVideo();
     if (!next) {
       selected = null;
@@ -131,7 +151,8 @@
     if (host.parentNode !== parent) parent.append(host);
     host.style.setProperty('display', fullscreen?.tagName === 'VIDEO' ? 'none' : 'block', 'important');
     const active = Boolean(document.pictureInPictureElement);
-    button.querySelector('span').textContent = active ? '退出小窗' : '小窗播放';
+    const label = active ? '退出小窗' : '小窗播放';
+    if (button.querySelector('span').textContent !== label) button.querySelector('span').textContent = label;
     button.setAttribute('aria-label', active ? '退出视频画中画小窗' : '在画中画小窗播放视频');
     button.title = active ? '返回原网页播放器' : '将视频放到独立悬浮窗口';
     button.disabled = busy;
@@ -167,35 +188,138 @@
     }
   }
 
-  function scan() {
-    scanTimer = null;
-    for (const video of videos) {
-      if (!video.isConnected) resizeObserver?.unobserve(video);
-    }
-    videos = [...document.querySelectorAll('video')];
-    for (const video of videos) {
-      resizeObserver?.observe(video);
-      if (watched.has(video)) continue;
-      watched.add(video);
-      for (const name of ['play', 'pause', 'ended', 'loadedmetadata', 'loadeddata', 'emptied', 'resize', 'enterpictureinpicture', 'leavepictureinpicture']) {
-        video.addEventListener(name, () => {
-          if (name === 'leavepictureinpicture') setStatus();
-          refresh();
-        });
-      }
-    }
-    refresh();
+  function onVideoEvent(event) {
+    if (event.type === 'leavepictureinpicture') setStatus();
+    scheduleRefresh();
   }
 
-  function scheduleScan() {
-    if (!scanTimer) scanTimer = setTimeout(scan, 150);
+  function trackVideo(video) {
+    if (videos.has(video)) return false;
+    videos.add(video);
+    if (!watched.has(video)) {
+      watched.add(video);
+      for (const name of ['play', 'pause', 'ended', 'loadedmetadata', 'loadeddata', 'emptied', 'resize', 'enterpictureinpicture', 'leavepictureinpicture']) {
+        video.addEventListener(name, onVideoEvent);
+      }
+    }
+    return true;
+  }
+
+  function sameNodes(a, b) {
+    return a.size === b.size && [...a].every(node => b.has(node));
+  }
+
+  function syncLayoutTracking() {
+    const nextLayoutNodes = new Set();
+    for (const video of videos) {
+      for (let node = video; node; node = node.parentElement) nextLayoutNodes.add(node);
+    }
+    const changed = !sameNodes(layoutNodes, nextLayoutNodes);
+    layoutNodes = nextLayoutNodes;
+    if (document.hidden) return changed;
+
+    // Observe styles only on videos and their ancestors. A page-wide attribute
+    // observer would wake up for unrelated animations and application updates.
+    if (changed || !attributesListening) {
+      attributeObserver.disconnect();
+      for (const node of layoutNodes) {
+        attributeObserver.observe(node, { attributes: true, attributeFilter: ['class', 'style', 'hidden', 'disablepictureinpicture'] });
+      }
+      attributesListening = layoutNodes.size > 0;
+    }
+
+    const sizes = new Set(videos);
+    if (videos.size && document.body) sizes.add(document.body);
+    for (const node of observedSizes) {
+      if (!sizes.has(node)) {
+        resizeObserver?.unobserve(node);
+        observedSizes.delete(node);
+      }
+    }
+    for (const node of sizes) {
+      if (!observedSizes.has(node)) {
+        resizeObserver?.observe(node);
+        observedSizes.add(node);
+      }
+    }
+    const needed = videos.size > 0;
+    if (layoutListening !== needed) {
+      layoutListening = needed;
+      const method = needed ? 'addEventListener' : 'removeEventListener';
+      window[method]('resize', scheduleRefresh, { passive: true });
+      window[method]('scroll', scheduleRefresh, { capture: true, passive: true });
+      document[method]('fullscreenchange', scheduleRefresh);
+    }
+    return changed;
+  }
+
+  function pruneVideos() {
+    let changed = false;
+    for (const video of videos) {
+      if (!video.isConnected) {
+        videos.delete(video);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  function discoverAddedVideos() {
+    discoveryTimer = null;
+    if (document.hidden) return;
+    let changed = pruneVideos();
+    for (const root of pendingRoots) {
+      if (!root.isConnected) continue;
+      // The parser/framework may report both a new parent and its children.
+      // Search the outermost added subtree once, never the whole document.
+      let covered = false;
+      for (let parent = root.parentElement; parent; parent = parent.parentElement) {
+        if (pendingRoots.has(parent)) { covered = true; break; }
+      }
+      if (covered) continue;
+      if (root instanceof HTMLVideoElement) changed = trackVideo(root) || changed;
+      for (const video of root.querySelectorAll('video')) changed = trackVideo(video) || changed;
+    }
+    pendingRoots.clear();
+    const layoutChanged = syncLayoutTracking();
+    if (changed || layoutChanged) scheduleRefresh();
+  }
+
+  function onMutations(records) {
+    let needsDiscovery = false;
+    let layoutChanged = false;
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node === host || node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node instanceof HTMLVideoElement || node.childElementCount) {
+          pendingRoots.add(node);
+          needsDiscovery = true;
+        }
+      }
+      if (videos.size && [...record.removedNodes].some(node => node !== host && node.nodeType === Node.ELEMENT_NODE)) needsDiscovery = true;
+      if (layoutNodes.has(record.target) && [...record.addedNodes, ...record.removedNodes].some(node => node !== host)) layoutChanged = true;
+    }
+    if (needsDiscovery && !discoveryTimer) discoveryTimer = setTimeout(discoverAddedVideos, 120);
+    if (layoutChanged) scheduleRefresh();
+  }
+
+  function synchronizeVideos() {
+    clearTimeout(discoveryTimer);
+    discoveryTimer = null;
+    pendingRoots.clear();
+    pruneVideos();
+    // A full search is only needed on startup, returning to a hidden tab, or
+    // an explicit request from the extension popup.
+    for (const video of document.querySelectorAll('video')) trackVideo(video);
+    syncLayoutTracking();
+    refresh();
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender.id !== chrome.runtime.id || message?.type !== 'PIP_SHOW_CONTROLS') return false;
-    scan();
+    synchronizeVideos();
     const blocked = reason(selected);
-    const result = { ok: !blocked, count: videos.length, reason: blocked };
+    const result = { ok: !blocked, count: videos.size, reason: blocked };
     if (host && selected) {
       clearTimeout(highlightTimer);
       panel.classList.add('highlight');
@@ -211,17 +335,31 @@
     return false;
   });
 
-  const observer = new MutationObserver(scheduleScan);
-  observer.observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'hidden', 'disablepictureinpicture'] });
-  window.addEventListener('resize', scheduleScan, { passive: true });
-  window.addEventListener('scroll', scheduleRefresh, { capture: true, passive: true });
-  document.addEventListener('fullscreenchange', refresh);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) scan(); });
-  // Detect resizing players and SPA layout changes without inspecting every DOM node.
-  if (resizeObserver) {
-    const watchDocumentSize = () => { if (document.body) resizeObserver.observe(document.body); };
-    if (document.body) watchDocumentSize();
-    else document.addEventListener('DOMContentLoaded', watchDocumentSize, { once: true });
+  const observer = new MutationObserver(onMutations);
+  function updateVisibility() {
+    if (!document.hidden) {
+      observer.observe(document, { childList: true, subtree: true });
+      synchronizeVideos();
+      return;
+    }
+    // Keep native media/PiP event listeners, but pause discovery and all layout
+    // work for background tabs. Resume with one reconciliation when visible.
+    observer.disconnect();
+    attributeObserver.disconnect();
+    attributesListening = false;
+    resizeObserver?.disconnect();
+    observedSizes.clear();
+    window.removeEventListener('resize', scheduleRefresh);
+    window.removeEventListener('scroll', scheduleRefresh, true);
+    document.removeEventListener('fullscreenchange', scheduleRefresh);
+    layoutListening = false;
+    clearTimeout(discoveryTimer);
+    clearTimeout(refreshTimer);
+    cancelAnimationFrame(refreshFrame);
+    cancelAnimationFrame(positionFrame);
+    discoveryTimer = refreshTimer = refreshFrame = positionFrame = null;
+    pendingRoots.clear();
   }
-  scan();
+  document.addEventListener('visibilitychange', updateVisibility);
+  updateVisibility();
 })();
