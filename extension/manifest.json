@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "链接新开",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "普通网页链接在新标签页打开，保留当前页面；支持视频画中画小窗、自动切换和网站例外。",
   "minimum_chrome_version": "109",
   "permissions": [

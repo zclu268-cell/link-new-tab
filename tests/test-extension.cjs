@@ -242,6 +242,42 @@ async function test(name, run) {
     assert.equal(context.pages().length,1); assert.equal(page.url(),oldUrl);
   });
   await test('跨域 iframe：仅排除 iframe 域名时，顶层网站仍生效', () => expectNew('#ordinary','ordinary',{excludedHosts:['localhost']},true));
+
+  await test('ChatGPT 来源规则：覆盖新旧域名和子域，不误伤其他网站', async () => {
+    const results = await worker.evaluate(() => {
+      const config = LinkNewTab.settings({ excludedHosts:[] });
+      return Object.fromEntries(['chatgpt.com','www.chatgpt.com','CHATGPT.COM.','chat.openai.com','notchatgpt.com','chatgpt.com.example.org','platform.openai.com','example.org'].map(host => [host,LinkNewTab.enabledOn(config,host)]));
+    });
+    for (const host of ['chatgpt.com','www.chatgpt.com','CHATGPT.COM.','chat.openai.com']) assert.equal(results[host],false,host);
+    for (const host of ['notchatgpt.com','chatgpt.com.example.org','platform.openai.com','example.org']) assert.equal(results[host],true,host);
+  });
+  await test('ChatGPT 页面与跨域 iframe 保留原生导航且没有链接捕获监听', async () => {
+    // These HTTPS hosts are fulfilled entirely by local fixture HTML, never by
+    // a logged-in ChatGPT session or the public service.
+    const reply = async route => route.fulfill({contentType:'text/html',body:
+      '<!doctype html><a id="spa" href="/c/next">Conversation</a><a id="ordinary" href="/target">Ordinary</a>' +
+      (route.request().url().includes('chatgpt.com') ? '<iframe src="https://player.example.test/frame"></iframe>' : '') +
+      '<script>document.querySelector("#spa").onclick=e=>{e.preventDefault();history.pushState({},"","/c/next");};</script>'});
+    await context.route('https://chatgpt.com/**',reply);
+    await context.route('https://player.example.test/**',reply);
+    const page = await fixture();
+    try {
+      await page.goto('https://chatgpt.com/c/current'); await delay(200);
+      const probe = await linkListenerProbe(page);
+      try { assert.equal(await probe.count(),0); } finally { await probe.close(); }
+      await page.locator('#spa').click();
+      assert.equal(new URL(page.url()).pathname,'/c/next'); assert.equal(context.pages().length,1);
+      const frame = page.frames().find(frame=>frame.url().startsWith('https://player.example.test/')); assert(frame);
+      await frame.locator('#ordinary').click(); await frame.waitForURL('**/target');
+      assert.equal(context.pages().length,1); assert.equal(new URL(page.url()).pathname,'/c/next');
+      await page.locator('#ordinary').click(); await page.waitForURL('https://chatgpt.com/target');
+      assert.equal(context.pages().length,1);
+    } finally {
+      await context.unroute('https://chatgpt.com/**',reply);
+      await context.unroute('https://player.example.test/**',reply);
+    }
+  });
+
   const observedMessages = await worker.evaluate(() => globalThis.testObservedMessages);
   run.writeJson('observed-extension-messages.json', observedMessages);
 
@@ -274,6 +310,18 @@ async function test(name, run) {
     assert.equal(await worker.evaluate(async () => (await chrome.storage.local.get('active')).active),false);
     await popup.reload(); await popup.locator('#active:not([disabled])').waitFor();
     assert.equal(await popup.locator('#active').isChecked(),false);
+  });
+  await test('ChatGPT 面板显示原生链接例外，网站开关关闭且不影响视频入口', async () => {
+    const popup = context.pages().find(page=>page.url().endsWith('/popup.html'));
+    // Supply tab metadata to the real rendering functions; toolbar activeTab
+    // grants are outside this fixture's scope.
+    await popup.evaluate(()=>{identifySite({id:123,url:'https://chatgpt.com/c/test'});render();});
+    assert.equal(await popup.locator('#site-enabled').isChecked(),false);
+    assert.equal(await popup.locator('#site-enabled').isDisabled(),true);
+    assert.match(await popup.locator('#site-help').innerText(),/ChatGPT 已排除/);
+    assert.equal(await popup.locator('#enabled').isEnabled(),true);
+    assert.equal(await popup.locator('#show-video-controls').isEnabled(),true);
+    await popup.screenshot({path:run.output('chatgpt-exception-preview.png'),fullPage:true});
   });
   await test('真实 runtime.reload：旧页下一次点击卸载失效监听，恢复原生导航', async () => {
     const page = await fixture();

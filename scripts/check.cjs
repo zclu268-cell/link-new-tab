@@ -34,7 +34,9 @@ function check() {
   }
   const popup = fs.readFileSync(path.join(extension, manifest.action.default_popup), 'utf8');
   for (const match of popup.matchAll(/\b(?:src|href)="([^"]+)"/g)) assets.add(match[1]);
-  assert(!/<script\b[^>]*>\s*\S[\s\S]*?<\/script>/i.test(popup), 'Popup must use external scripts');
+  for (const script of popup.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
+    assert(!script[1].trim(), 'Popup must use external scripts');
+  }
   for (const relative of assets) {
     assert(typeof relative === 'string' && !relative.includes('..') && !relative.includes(':') && !path.isAbsolute(relative), `Invalid asset path: ${relative}`);
     const absolute = path.join(extension, relative);

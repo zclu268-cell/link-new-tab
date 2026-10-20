@@ -35,17 +35,20 @@ function render() {
   enabledInput.checked = settings.enabled;
   activeInput.checked = settings.active;
   videoAutoInput.checked = settings.videoAuto;
-  siteInput.checked = Boolean(hostname && !settings.excludedHosts.includes(hostname));
+  const nativeLinks = Boolean(hostname && LinkNewTab.nativeLinksOn(hostname));
+  siteInput.checked = Boolean(hostname && !nativeLinks && !settings.excludedHosts.includes(hostname));
   enabledInput.disabled = !ready || pending.has("enabled");
   activeInput.disabled = !ready || pending.has("active");
-  siteInput.disabled = !ready || !hostname || pending.has("excludedHosts");
+  siteInput.disabled = !ready || !hostname || nativeLinks || pending.has("excludedHosts");
   videoAutoInput.disabled = !ready || pending.has("videoAuto") || videoPending;
   const videoUnavailable = !ready || !hostname || !Number.isInteger(tabId) || videoPending || pending.has("videoAuto");
   videoButton.disabled = videoUnavailable;
   hideVideoButton.disabled = videoUnavailable;
   summary.textContent = !settings.enabled
     ? "已暂停，链接按网页原有方式打开"
-    : hostname && settings.excludedHosts.includes(hostname)
+    : nativeLinks
+      ? "ChatGPT 保持网页原本的打开方式"
+      : hostname && settings.excludedHosts.includes(hostname)
       ? "已开启，当前网站除外"
       : "保留当前页面，继续探索";
 }
@@ -83,6 +86,9 @@ function identifySite(tab) {
     return;
   }
   hostname = url.hostname;
+  if (LinkNewTab.nativeLinksOn(hostname)) {
+    siteHelp.textContent = "ChatGPT 已排除链接新开，切换对话使用网页原有方式。";
+  }
 }
 
 const VIDEO_ERRORS = {
@@ -202,7 +208,7 @@ enabledInput.addEventListener("change", () => save("enabled", enabledInput.check
 activeInput.addEventListener("change", () => save("active", activeInput.checked));
 videoAutoInput.addEventListener("change", () => save("videoAuto", videoAutoInput.checked));
 siteInput.addEventListener("change", async () => {
-  if (!hostname || pending.has("excludedHosts")) return;
+  if (!hostname || LinkNewTab.nativeLinksOn(hostname) || pending.has("excludedHosts")) return;
   const enableSite = siteInput.checked;
   pending.add("excludedHosts");
   siteInput.disabled = true;

@@ -26,9 +26,14 @@ globalThis.LinkNewTab = (() => {
     return webUrl(value)?.hostname || '';
   }
 
-  function enabledOn(config, host) {
-    return config.enabled && !config.excludedHosts.includes(host.toLowerCase());
+  function nativeLinksOn(host) {
+    const name = host.toLowerCase().replace(/\.$/, "");
+    return name === "chatgpt.com" || name.endsWith(".chatgpt.com") || name === "chat.openai.com";
   }
 
-  return { defaults, settings, webUrl, hostname, enabledOn };
+  function enabledOn(config, host) {
+    return config.enabled && !nativeLinksOn(host) && !config.excludedHosts.includes(host.toLowerCase());
+  }
+
+  return { defaults, settings, webUrl, hostname, nativeLinksOn, enabledOn };
 })();
