@@ -1,6 +1,6 @@
 "use strict";
 
-const DEFAULTS = { enabled: true, active: true, excludedHosts: [] };
+const DEFAULTS = { enabled: true, active: true, videoAuto: false, excludedHosts: [] };
 const enabledInput = document.getElementById("enabled");
 const activeInput = document.getElementById("active");
 const siteInput = document.getElementById("site-enabled");
@@ -10,6 +10,8 @@ const siteHelp = document.getElementById("site-help");
 const feedback = document.getElementById("feedback");
 const error = document.getElementById("error");
 const videoButton = document.getElementById("show-video-controls");
+const hideVideoButton = document.getElementById("hide-video-controls");
+const videoAutoInput = document.getElementById("video-auto");
 const videoFeedback = document.getElementById("video-feedback");
 let hostname = null;
 let tabId = null;
@@ -22,6 +24,7 @@ function normalizeSettings(value) {
   return {
     enabled: typeof value.enabled === "boolean" ? value.enabled : true,
     active: typeof value.active === "boolean" ? value.active : true,
+    videoAuto: value.videoAuto === true,
     excludedHosts: Array.isArray(value.excludedHosts)
       ? value.excludedHosts.filter((host) => typeof host === "string")
       : [],
@@ -31,11 +34,15 @@ function normalizeSettings(value) {
 function render() {
   enabledInput.checked = settings.enabled;
   activeInput.checked = settings.active;
+  videoAutoInput.checked = settings.videoAuto;
   siteInput.checked = Boolean(hostname && !settings.excludedHosts.includes(hostname));
   enabledInput.disabled = !ready || pending.has("enabled");
   activeInput.disabled = !ready || pending.has("active");
   siteInput.disabled = !ready || !hostname || pending.has("excludedHosts");
-  videoButton.disabled = !ready || !hostname || !Number.isInteger(tabId) || videoPending;
+  videoAutoInput.disabled = !ready || pending.has("videoAuto") || videoPending;
+  const videoUnavailable = !ready || !hostname || !Number.isInteger(tabId) || videoPending || pending.has("videoAuto");
+  videoButton.disabled = videoUnavailable;
+  hideVideoButton.disabled = videoUnavailable;
   summary.textContent = !settings.enabled
     ? "已暂停，链接按网页原有方式打开"
     : hostname && settings.excludedHosts.includes(hostname)
@@ -88,7 +95,7 @@ const VIDEO_ERRORS = {
   "no-access": "暂时无法访问此页面。请刷新网页，并检查扩展的网站访问权限。",
 };
 
-async function requestVideoControls(targetTabId) {
+async function requestVideoControls(targetTabId, type = "PIP_SHOW_CONTROLS") {
   const requestId = crypto.randomUUID();
   let timer;
   let receive;
@@ -119,7 +126,7 @@ async function requestVideoControls(targetTabId) {
         const reason = priority.find((value) => results.some((result) => result.reason === value));
         finish({ ok: false, reason: reason || "no-access" });
       }, 500);
-      chrome.tabs.sendMessage(targetTabId, { type: "PIP_SHOW_CONTROLS", requestId })
+      chrome.tabs.sendMessage(targetTabId, { type, requestId })
         .then(accept)
         .catch(() => {
           // Another frame can still answer through runtime messaging. Wait for
@@ -132,21 +139,28 @@ async function requestVideoControls(targetTabId) {
   }
 }
 
-videoButton.addEventListener("click", async () => {
-  if (videoPending || !hostname || !Number.isInteger(tabId)) return;
+async function changeVideoControls(type) {
+  if (videoPending || pending.has("videoAuto") || !hostname || !Number.isInteger(tabId)) return;
+  const stopping = type === "PIP_HIDE_CONTROLS";
   videoPending = true;
   videoFeedback.dataset.state = "";
-  videoFeedback.textContent = "正在查找网页视频…";
+  videoFeedback.textContent = stopping ? "正在停止本页视频检测…" : "正在查找网页视频…";
   render();
   try {
-    const response = await requestVideoControls(tabId);
+    const response = await requestVideoControls(tabId, type);
     if (response?.ok) {
       videoFeedback.dataset.state = "success";
-      videoFeedback.textContent = "请回到网页，点击视频上的“小窗播放”。";
+      videoFeedback.textContent = stopping
+        ? settings.videoAuto
+          ? "已停止当前检测，小窗继续播放。新加载的内嵌播放器仍会自动检测；关闭自动显示可全部停止。"
+          : "已停止本页检测。需要时再次点击“显示小窗按钮”；已打开的小窗会继续播放。"
+        : settings.videoAuto
+          ? "请回到网页，点击视频上的“小窗播放”。当前开启了自动显示；可点击“停止本页检测”暂停此页。"
+          : "请回到网页，点击视频上的“小窗播放”。此页会持续检测，直到停止、离开网页或移除全部视频。";
     } else {
       videoFeedback.dataset.state = "error";
       videoFeedback.textContent = VIDEO_ERRORS[response?.reason] ||
-        "暂时无法显示按钮。安装或更新后，请先刷新网页再重试。";
+        (stopping ? "暂时无法停止检测，请刷新网页后重试。" : "暂时无法显示按钮。安装或更新后，请先刷新网页再重试。");
     }
   } catch {
     videoFeedback.dataset.state = "error";
@@ -155,7 +169,10 @@ videoButton.addEventListener("click", async () => {
     videoPending = false;
     render();
   }
-});
+}
+
+videoButton.addEventListener("click", () => changeVideoControls("PIP_SHOW_CONTROLS"));
+hideVideoButton.addEventListener("click", () => changeVideoControls("PIP_HIDE_CONTROLS"));
 
 async function save(key, value) {
   if (pending.has(key)) return;
@@ -167,6 +184,12 @@ async function save(key, value) {
     await chrome.storage.local.set({ [key]: value });
     settings = normalizeSettings({ ...settings, [key]: value });
     feedback.textContent = "已保存";
+    if (key === "videoAuto") {
+      videoFeedback.dataset.state = "success";
+      videoFeedback.textContent = value
+        ? "已开启自动显示，网页会自动查找视频。停止本页检测后，可手动再次显示或切换此开关恢复。"
+        : "已关闭自动显示，并停止所有页面的视频检测；已打开的小窗会继续播放。需要时点击“显示小窗按钮”。";
+    }
   } catch {
     showError("保存失败，请关闭面板后重试。");
   } finally {
@@ -177,6 +200,7 @@ async function save(key, value) {
 
 enabledInput.addEventListener("change", () => save("enabled", enabledInput.checked));
 activeInput.addEventListener("change", () => save("active", activeInput.checked));
+videoAutoInput.addEventListener("change", () => save("videoAuto", videoAutoInput.checked));
 siteInput.addEventListener("change", async () => {
   if (!hostname || pending.has("excludedHosts")) return;
   const enableSite = siteInput.checked;

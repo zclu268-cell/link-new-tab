@@ -176,6 +176,7 @@ async function churn(page, kind = 'children') {
     args:['--disable-extensions-except=' + extensionPath, '--load-extension=' + extensionPath],
   });
   const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker', { timeout:15000 });
+  await worker.evaluate(() => chrome.storage.local.set({ videoAuto:true }));
   const extensionId = new URL(worker.url()).host;
   const page = await context.newPage();
   await page.goto(origin);

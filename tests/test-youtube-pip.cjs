@@ -40,6 +40,13 @@ const budget = (limit) => Math.max(1, Math.min(limit, deadline - Date.now()));
   result.step = 'wait-for-playback';
   await page.waitForFunction(() => [...document.querySelectorAll('video')].some(video => video.readyState >= 2 && video.videoWidth > 0 && !video.paused), null, { timeout: budget(15000) });
   result.videoBefore = await video.evaluate(video => ({readyState: video.readyState, width: video.videoWidth, height: video.videoHeight, paused: video.paused, currentTime: video.currentTime, disabled: video.disablePictureInPicture, pipEnabled: document.pictureInPictureEnabled}));
+  result.step = 'request-video-controls';
+  await page.bringToFront();
+  result.controls = await worker.evaluate(async () => {
+    const [tab] = await chrome.tabs.query({ active:true, currentWindow:true });
+    if (!tab) throw Error('YouTube test tab not found');
+    return chrome.tabs.sendMessage(tab.id, { type:'PIP_SHOW_CONTROLS' });
+  });
   result.step = 'click-extension-pip-button';
   const pipButton = page.locator('link-new-tab-video-tools button[data-action="pip"]');
   await pipButton.waitFor({state: 'visible', timeout: budget(5000)});

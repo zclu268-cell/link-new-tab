@@ -16,18 +16,28 @@
   let attributesListening = false;
   let needsPrune = false;
   let disposed = false;
-  let suspended = false;
-  const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(scheduleRefresh) : null;
-  const attributeObserver = new MutationObserver(scheduleRefresh);
-  const intersectionObserver = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
-    if (!isActive() || suspended || document.hidden) return;
-    for (const entry of entries) {
-      if (!videos.has(entry.target)) continue;
-      if (entry.isIntersecting) visibleVideos.add(entry.target);
-      else visibleVideos.delete(entry.target);
-    }
-    scheduleRefresh();
-  }) : null;
+  let suspended = true;
+  let running = false;
+  let videoAuto = false;
+  let pageStopped = false;
+  let generation = 0;
+  let settingsRevision = 0;
+  let observer, resizeObserver, attributeObserver, intersectionObserver;
+
+  function createObservers() {
+    observer = new MutationObserver(onMutations);
+    resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(scheduleRefresh) : null;
+    attributeObserver = new MutationObserver(scheduleRefresh);
+    intersectionObserver = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
+      if (!isRunning() || suspended || document.hidden) return;
+      for (const entry of entries) {
+        if (!videos.has(entry.target)) continue;
+        if (entry.isIntersecting) visibleVideos.add(entry.target);
+        else visibleVideos.delete(entry.target);
+      }
+      scheduleRefresh();
+    }) : null;
+  }
 
   function isActive() {
     if (disposed) return false;
@@ -36,10 +46,12 @@
     return false;
   }
 
+  function isRunning() { return isActive() && running; }
+
   function suspend() {
     suspended = true;
-    observer.disconnect();
-    attributeObserver.disconnect();
+    observer?.disconnect();
+    attributeObserver?.disconnect();
     attributesListening = false;
     resizeObserver?.disconnect();
     intersectionObserver?.disconnect();
@@ -58,11 +70,12 @@
     needsPrune = false;
   }
 
-  function dispose() {
-    if (disposed) return;
-    disposed = true;
+  function deactivate() {
+    running = false;
+    generation++;
     suspend();
     clearTimeout(highlightTimer);
+    highlightTimer = null;
     for (const video of videos) untrackVideo(video);
     layoutNodes.clear();
     playingVideos.clear();
@@ -70,11 +83,43 @@
     window.removeEventListener('focus', onFocus);
     window.removeEventListener('pagehide', onPageHide);
     window.removeEventListener('pageshow', onPageShow);
-    try { chrome.runtime.onMessage.removeListener(onMessage); } catch { /* Already invalidated. */ }
     button?.removeEventListener('click', togglePictureInPicture);
     host?.remove();
     selected = host = button = status = panel = null;
+    observer = resizeObserver = attributeObserver = intersectionObserver = null;
+    busy = false;
+    lastRefresh = 0;
     // Removing our controls must not interrupt native playback or Picture-in-Picture.
+  }
+
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    deactivate();
+    try {
+      chrome.runtime.onMessage.removeListener(onMessage);
+      chrome.storage.onChanged.removeListener(onSettingsChanged);
+    } catch { /* Already invalidated. */ }
+  }
+
+  function activate(knownVideos = null, forceScan = false) {
+    if (!isActive()) return;
+    if (running) { synchronizeVideos(forceScan, knownVideos); return; }
+    running = true;
+    generation++;
+    createObservers();
+    document.addEventListener('visibilitychange', updateVisibility);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('pageshow', onPageShow);
+    suspended = document.hidden;
+    if (suspended) {
+      // A background frame has no layout work until it becomes visible.
+      if (knownVideos) for (const video of knownVideos) trackVideo(video);
+      return;
+    }
+    observer.observe(document, { childList: true, subtree: true });
+    synchronizeVideos(forceScan, knownVideos);
   }
 
   const messages = {
@@ -171,7 +216,7 @@
 
   function positionControls() {
     positionFrame = null;
-    if (!isActive() || suspended || document.hidden || !host || !selected) return;
+    if (!isRunning() || suspended || document.hidden || !host || !selected) return;
     const r = selected.getBoundingClientRect();
     const onScreen = visibleArea(selected, r) > 0;
     const panelRect = panel.getBoundingClientRect();
@@ -186,16 +231,16 @@
   }
 
   function schedulePosition() {
-    if (isActive() && !suspended && !document.hidden && !positionFrame) positionFrame = requestAnimationFrame(positionControls);
+    if (isRunning() && !suspended && !document.hidden && !positionFrame) positionFrame = requestAnimationFrame(positionControls);
   }
 
   function scheduleRefresh() {
-    if (!isActive() || suspended || document.hidden || (!videos.size && !selected) || refreshFrame || refreshTimer) return;
+    if (!isRunning() || suspended || document.hidden || (!videos.size && !selected) || refreshFrame || refreshTimer) return;
     // Scrolling and player animations can emit many events in one frame. Keep
     // video selection at most ten times per second, without a polling loop.
     const enqueue = () => {
       refreshTimer = null;
-      if (!isActive() || suspended || document.hidden) return;
+      if (!isRunning() || suspended || document.hidden) return;
       refreshFrame = requestAnimationFrame(() => {
         refreshFrame = null;
         refresh();
@@ -207,7 +252,7 @@
   }
 
   function refresh(forceScan = false) {
-    if (!isActive() || suspended || document.hidden) return;
+    if (!isRunning() || suspended || document.hidden) return;
     lastRefresh = performance.now();
     const next = busy ? selected : chooseVideo(forceScan);
     if (!next) {
@@ -233,7 +278,7 @@
   }
 
   async function togglePictureInPicture(event) {
-    if (!isActive()) return;
+    if (!isRunning()) return;
     event.preventDefault();
     event.stopPropagation();
     if (!event.isTrusted || busy) return;
@@ -246,25 +291,31 @@
       return;
     }
     busy = true;
+    const requestGeneration = generation;
     button.disabled = true;
     setStatus();
     try {
       if (exiting) await document.exitPictureInPicture();
       else await video.requestPictureInPicture();
     } catch (error) {
-      if (!isActive()) return;
+      if (!isRunning() || requestGeneration !== generation) return;
       const failure = error.name === 'NotAllowedError' ? 'gesture' :
         error.name === 'SecurityError' ? 'policy' :
         error.name === 'NotSupportedError' ? 'not-supported' : reason(video) || 'failed';
       setStatus(messages[failure]);
     } finally {
-      busy = false;
-      if (isActive()) refresh();
+      // The user may stop detection while the native PiP promise is pending.
+      // A completion from an old session must not recreate controls or change
+      // the busy state of a newly activated session.
+      if (isRunning() && requestGeneration === generation) {
+        busy = false;
+        refresh();
+      }
     }
   }
 
   function onVideoEvent(event) {
-    if (!isActive()) return;
+    if (!isRunning()) return;
     updatePlaying(event.currentTarget);
     if (event.type === 'leavepictureinpicture') setStatus();
     scheduleRefresh();
@@ -355,7 +406,7 @@
 
   function discoverAddedVideos() {
     discoveryTimer = null;
-    if (!isActive() || suspended || document.hidden) return;
+    if (!isRunning() || suspended || document.hidden) return;
     let changed = needsPrune && pruneVideos();
     needsPrune = false;
     let ancestryChanged = false;
@@ -378,12 +429,13 @@
       }
     }
     pendingRoots.clear();
+    if (!videoAuto && !videos.size) { deactivate(); return; }
     const layoutChanged = (changed || ancestryChanged) && syncLayoutTracking();
     if (changed || layoutChanged) scheduleRefresh();
   }
 
   function onMutations(records) {
-    if (!isActive() || suspended || document.hidden) return;
+    if (!isRunning() || suspended || document.hidden) return;
     let needsDiscovery = false;
     let layoutChanged = false;
     for (const record of records) {
@@ -406,33 +458,49 @@
     if (layoutChanged) scheduleRefresh();
   }
 
-  function synchronizeVideos(forceScan = false) {
-    if (!isActive() || suspended || document.hidden) return;
+  function synchronizeVideos(forceScan = false, knownVideos = null) {
+    if (!isRunning() || suspended || document.hidden) return;
     clearTimeout(discoveryTimer);
     discoveryTimer = null;
     pendingRoots.clear();
     needsPrune = false;
     pruneVideos();
-    // A full search is only needed on startup, returning to a hidden tab, or
-    // an explicit request from the extension popup.
-    for (const video of document.querySelectorAll('video')) trackVideo(video);
+    // Dormant pages never call this function. Reuse the explicit request's
+    // result when activating, so each manual request searches only once.
+    for (const video of knownVideos || document.querySelectorAll('video')) trackVideo(video);
+    if (!videoAuto && !videos.size) { deactivate(); return; }
     syncLayoutTracking();
     refresh(forceScan);
   }
 
   function onMessage(message, sender, sendResponse) {
     if (!isActive()) return false;
-    if (sender.id !== chrome.runtime.id || message?.type !== 'PIP_SHOW_CONTROLS') return false;
-    synchronizeVideos(true);
-    const blocked = reason(selected);
-    const result = { ok: !blocked, count: videos.size, reason: blocked };
-    if (host && selected) {
+    if (sender.id !== chrome.runtime.id || !['PIP_SHOW_CONTROLS', 'PIP_HIDE_CONTROLS'].includes(message?.type)) return false;
+    const stopping = message.type === 'PIP_HIDE_CONTROLS';
+    if (stopping) {
+      // A per-page stop also overrides automatic mode until the next explicit
+      // show request, settings toggle, or navigation to a new document.
+      pageStopped = true;
+      deactivate();
+    } else {
+      pageStopped = false;
+      if (running) synchronizeVideos(true);
+      else {
+        const found = document.querySelectorAll('video');
+        // An empty top frame or unrelated iframe must remain dormant.
+        if (found.length) activate(found, true);
+      }
+    }
+    const blocked = stopping ? 'stopped' : reason(selected);
+    const result = { ok: stopping || !blocked, count: videos.size, reason: blocked };
+    if (!stopping && host && selected) {
       clearTimeout(highlightTimer);
       panel.classList.add('highlight');
       setStatus(blocked ? messages[blocked] : '点击上方“小窗播放”，视频会在独立窗口中播放。');
       schedulePosition();
       highlightTimer = setTimeout(() => {
-        if (!isActive()) return;
+        highlightTimer = null;
+        if (!isRunning()) return;
         panel.classList.remove('highlight');
         setStatus();
         schedulePosition();
@@ -441,15 +509,16 @@
     sendResponse(result);
     // Popup aggregates all frames, so an empty top frame cannot mask an embedded video.
     if (typeof message.requestId === 'string') {
-      chrome.runtime.sendMessage({ type: 'PIP_CONTROL_RESULT', requestId: message.requestId, result }).catch(() => {});
+      try {
+        chrome.runtime.sendMessage({ type: 'PIP_CONTROL_RESULT', requestId: message.requestId, result }).catch(() => {});
+      } catch { isActive(); }
     }
     return false;
   }
   chrome.runtime.onMessage.addListener(onMessage);
 
-  const observer = new MutationObserver(onMutations);
   function updateVisibility() {
-    if (!isActive()) return;
+    if (!isRunning()) return;
     if (!document.hidden) {
       suspended = false;
       observer.observe(document, { childList: true, subtree: true });
@@ -464,19 +533,47 @@
     // work for background tabs. Resume with one reconciliation when visible.
     suspend();
   }
-  function onFocus() { isActive(); }
+  function onFocus() { isRunning(); }
   function onPageHide(event) {
-    if (!isActive()) return;
+    if (!isRunning()) return;
     if (event.persisted) suspend();
     else dispose();
   }
-  function onPageShow(event) {
-    if (!isActive()) return;
-    if (event.persisted) updateVisibility();
+  async function onPageShow(event) {
+    if (!isRunning() || !event.persisted) return;
+    const requestGeneration = generation;
+    const revision = settingsRevision;
+    try {
+      // Storage events can be delayed while a document is in the page cache.
+      const config = await chrome.storage.local.get({ videoAuto: false });
+      if (!isRunning() || requestGeneration !== generation) return;
+      if (revision === settingsRevision && videoAuto !== (config.videoAuto === true)) {
+        applyAutoSetting(config.videoAuto === true);
+      }
+      if (isRunning()) updateVisibility();
+    } catch { isActive(); }
   }
-  document.addEventListener('visibilitychange', updateVisibility);
-  window.addEventListener('focus', onFocus);
-  window.addEventListener('pagehide', onPageHide);
-  window.addEventListener('pageshow', onPageShow);
-  updateVisibility();
+
+  function applyAutoSetting(enabled) {
+    videoAuto = enabled;
+    pageStopped = false;
+    if (enabled) activate();
+    else deactivate();
+  }
+
+  function onSettingsChanged(changes, area) {
+    if (area !== 'local' || !changes.videoAuto || !isActive()) return;
+    settingsRevision++;
+    applyAutoSetting(changes.videoAuto.newValue === true);
+  }
+  chrome.storage.onChanged.addListener(onSettingsChanged);
+
+  // Default startup has no DOM queries, observers or page/media listeners.
+  // Static message delivery keeps existing storage + activeTab permissions.
+  const initialRevision = settingsRevision;
+  chrome.storage.local.get({ videoAuto: false }).then(config => {
+    if (!isActive() || settingsRevision !== initialRevision) return;
+    videoAuto = config.videoAuto === true;
+    if (videoAuto && !pageStopped) activate();
+  }).catch(() => { isActive(); });
 })();

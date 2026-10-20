@@ -60,6 +60,53 @@ async function waitNewPage(action) {
   return page;
 }
 async function activeTab() { return worker.evaluate(async () => (await chrome.tabs.query({active:true})).map(tab => ({id:tab.id,windowId:tab.windowId}))); }
+
+// Inspect the browser's registered content-script listeners. The native-method
+// counters additionally detect pointless remove/add cycles that leave count=1.
+async function linkListenerProbe(page) {
+  const session = await context.newCDPSession(page), worlds = [], scriptUrls = new Map();
+  const extensionId = new URL(worker.url()).host;
+  session.on('Runtime.executionContextCreated', ({ context: world }) => worlds.push(world));
+  session.on('Debugger.scriptParsed', script => scriptUrls.set(script.scriptId, script.url));
+  await session.send('Runtime.enable');
+  await session.send('Debugger.enable');
+  let world;
+  for (const candidate of worlds) {
+    if (candidate.auxData?.isDefault) continue;
+    const probe = await session.send('Runtime.evaluate', { contextId:candidate.id, expression:'globalThis.chrome?.runtime?.id', returnByValue:true });
+    if (probe.result.value === extensionId) { world = candidate; break; }
+  }
+  assert(world, 'The real extension isolated world must be available');
+  const evaluate = async (expression, returnByValue = true) => {
+    const response = await session.send('Runtime.evaluate', { contextId:world.id, expression, returnByValue });
+    assert(!response.exceptionDetails, 'Listener probe failed: ' + JSON.stringify(response.exceptionDetails));
+    return returnByValue ? response.result.value : response.result;
+  };
+  await evaluate(`(() => {
+    const counts = globalThis.__linkBindings = { added:0, removed:0 };
+    for (const [method, counter] of [['addEventListener','added'],['removeEventListener','removed']]) {
+      const native = EventTarget.prototype[method];
+      EventTarget.prototype[method] = function(type) {
+        if (this === window && type === 'click') counts[counter]++;
+        return Reflect.apply(native, this, arguments);
+      };
+    }
+  })()`);
+  return {
+    evaluate,
+    changes: () => evaluate('({...__linkBindings})'),
+    count: async () => {
+      const target = await evaluate('window', false);
+      try {
+        const { listeners } = await session.send('DOMDebugger.getEventListeners', { objectId:target.objectId });
+        return listeners.filter(listener => listener.type === 'click' && listener.useCapture &&
+          scriptUrls.get(listener.scriptId) === `chrome-extension://${extensionId}/content.js`).length;
+      } finally { await session.send('Runtime.releaseObject', { objectId:target.objectId }); }
+    },
+    close: () => session.detach(),
+  };
+}
+
 async function expectNew(selector, kind, patch = {}, sourceFrame = null) {
   const page = await fixture(sourceFrame ? '/parent' : '/fixture', patch);
   const oldUrl = page.url();
@@ -142,6 +189,47 @@ async function test(name, run) {
     const page = await fixture(); await settings({enabled:false}); await page.locator('#ordinary').click();
     await page.waitForURL('**/target?kind=ordinary'); assert.equal(context.pages().length,1);
   });
+  await test('真实 click 监听：全局关闭和网站例外卸载，反复恢复只保留一份', async () => {
+    const page = await fixture('/fixture', { enabled:false });
+    const probe = await linkListenerProbe(page);
+    try {
+      assert.equal(await probe.count(), 0, 'A page initialized with links disabled must have no click listener');
+      await settings();
+      assert.equal(await probe.count(), 1);
+      await settings({ excludedHosts:['127.0.0.1'] });
+      assert.equal(await probe.count(), 0, 'Excluding the current website must remove the actual listener');
+      await settings();
+      assert.equal(await probe.count(), 1);
+      for (let index = 0; index < 3; index++) {
+        await settings({ enabled:false });
+        assert.equal(await probe.count(), 0);
+        await settings();
+        assert.equal(await probe.count(), 1);
+      }
+      const next = await waitNewPage(() => page.locator('#ordinary').click());
+      assert.equal(context.pages().length, 2, 'Re-enabling must still open exactly one tab');
+      assert.equal(new URL(next.url()).searchParams.get('kind'), 'ordinary');
+    } finally { await probe.close(); }
+  });
+  await test('视频偏好和前后台偏好变化不重复注册链接 click 监听', async () => {
+    const page = await fixture();
+    const probe = await linkListenerProbe(page);
+    try {
+      assert.equal(await probe.count(), 1);
+      await worker.evaluate(() => chrome.storage.local.set({ videoAuto:true }));
+      await delay(100);
+      await worker.evaluate(() => chrome.storage.local.set({ videoAuto:false, active:false }));
+      await delay(100);
+      assert.equal(await probe.count(), 1);
+      assert.deepEqual(await probe.changes(), { added:0, removed:0 }, 'Unrelated preferences must not cycle the click registration');
+      const before = (await activeTab())[0];
+      await waitNewPage(() => page.locator('#ordinary').click());
+      assert.equal((await activeTab())[0].id, before.id, 'The new background-tab preference must still take effect');
+    } finally {
+      await probe.close();
+      await worker.evaluate(() => chrome.storage.local.set({ videoAuto:false }));
+    }
+  });
   await test('当前网站排除：普通链接在当前页原生导航', async () => {
     const page = await fixture('/fixture',{excludedHosts:['127.0.0.1']}); await page.locator('#ordinary').click();
     await page.waitForURL('**/target?kind=ordinary'); assert.equal(context.pages().length,1);
@@ -187,10 +275,29 @@ async function test(name, run) {
     await popup.reload(); await popup.locator('#active:not([disabled])').waitFor();
     assert.equal(await popup.locator('#active').isChecked(),false);
   });
+  await test('真实 runtime.reload：旧页下一次点击卸载失效监听，恢复原生导航', async () => {
+    const page = await fixture();
+    const probe = await linkListenerProbe(page);
+    try {
+      assert.equal(await probe.count(), 1);
+      try { await worker.evaluate(() => chrome.runtime.reload()); }
+      catch (error) { if (!/closed|destroyed/i.test(error.message)) throw error; }
+      await delay(300);
+      assert.equal(await probe.evaluate('chrome.runtime.id || null'), null, 'The old world must really have lost its extension context');
+      await page.locator('#hash').click();
+      assert.equal(new URL(page.url()).hash, '#section');
+      assert.equal(await probe.count(), 0, 'An invalidated script must remove its listener on the first click');
+      assert.equal(await page.evaluate(() => window.fixtureClicks), 1, 'The invalidated handler must preserve the native event');
+    } finally { await probe.close(); }
+    await page.locator('#ordinary').click();
+    await page.waitForURL('**/target?kind=ordinary');
+    assert.equal(context.pages().length, 1);
+  });
 
   const { passed, json, markdown } = report(results, browserVersion, '链接新开：实际浏览器验收结果',
     '测试页面：仅监听本机 127.0.0.1 的 HTTP 服务，以 127.0.0.1 和 localhost 两个主机名验证跨域 iframe；使用真实浏览器点击。\n\n' +
     '新标签页用浏览器 tab ID 验证激活状态，并验证 window.opener 为 null。设置面板以扩展页面直接打开测试；真实工具栏弹出面板触发的 activeTab 授权与当前网站识别未纳入本次自动验收。\n\n' +
+    '通过 CDP 检查真实内容脚本的原生 click 监听注册，验证全局关闭、网站例外、无关偏好变化及真实 runtime.reload 后的卸载；没有替换扩展运行时 API。\n\n' +
     '未验证：Chrome 商店发布、所有第三方网站兼容性、用户日常 Chrome 中的实际安装。');
   run.writeText('report.md', markdown);
   run.writeJson('report.json', json);

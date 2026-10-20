@@ -1,11 +1,12 @@
 /* Shared by the service worker and the isolated content script. */
 globalThis.LinkNewTab = (() => {
-  const defaults = { enabled: true, active: true, excludedHosts: [] };
+  const defaults = { enabled: true, active: true, videoAuto: false, excludedHosts: [] };
 
   function settings(value = {}) {
     return {
       enabled: value.enabled !== false,
       active: value.active !== false,
+      videoAuto: value.videoAuto === true,
       excludedHosts: Array.isArray(value.excludedHosts)
         ? [...new Set(value.excludedHosts.filter(x => typeof x === 'string').map(x => x.toLowerCase()))]
         : []

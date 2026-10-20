@@ -46,9 +46,19 @@
 
       <section class="video-card" aria-labelledby="video-title">
         <h2 id="video-title">视频小窗</h2>
-        <p class="video-description">播放 YouTube 等网页视频后，点击视频上的「小窗播放」，可边看视频边使用其他窗口。</p>
-        <button id="show-video-controls" type="button" disabled>显示视频小窗按钮</button>
-        <p id="video-feedback" class="video-feedback" role="status" aria-live="polite">视频小窗独立于上面的链接设置。</p>
+        <p class="video-description">默认按需检测。播放网页视频后，点击「显示小窗按钮」，再到视频上点击「小窗播放」。</p>
+        <label class="setting video-setting" for="video-auto">
+          <span class="setting-copy">
+            <span class="setting-title">自动显示视频按钮</span>
+            <span class="setting-description" id="video-auto-help">开启后，网页会自动查找视频；关闭会停止所有页面的检测。</span>
+          </span>
+          <input type="checkbox" role="switch" id="video-auto" aria-describedby="video-auto-help" disabled>
+        </label>
+        <div class="video-actions">
+          <button id="show-video-controls" type="button" disabled>显示小窗按钮</button>
+          <button id="hide-video-controls" type="button" disabled>停止本页检测</button>
+        </div>
+        <p id="video-feedback" class="video-feedback" role="status" aria-live="polite">视频设置独立于链接设置，停止检测不关闭已有小窗。</p>
       </section>
 
       <p class="tip">首次安装或更新后，请刷新已打开的网页。</p>

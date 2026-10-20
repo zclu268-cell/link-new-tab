@@ -168,6 +168,7 @@ async function test(name, action) {
     args:['--disable-extensions-except=' + loadedExtensions, '--load-extension=' + loadedExtensions, '--autoplay-policy=no-user-gesture-required'],
   });
   let worker = await workerNamed('background.js');
+  await worker.evaluate(() => chrome.storage.local.set({ videoAuto:true }));
   const manager = await workerNamed('manager.js');
   extensionId = new URL(worker.url()).host;
   const browserVersion = context.browser().version();

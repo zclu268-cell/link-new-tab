@@ -52,7 +52,7 @@ const server = http.createServer((req, res) => {
 });
 
 async function settings(patch = {}) {
-  await worker.evaluate(async values => chrome.storage.local.set(values), { enabled: true, active: true, excludedHosts: [], ...patch });
+  await worker.evaluate(async values => chrome.storage.local.set(values), { enabled: true, active: true, excludedHosts: [], videoAuto: true, ...patch });
   await delay(80);
 }
 async function fixture(route = '/fixture', patch = {}) {

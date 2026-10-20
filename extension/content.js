@@ -3,34 +3,75 @@
   let ready = false;
   let host = '';
   let settingsRevision = 0;
+  let clickListening = false;
+  let disposed = false;
   let notice;
+  const linkSettingsKeys = ['enabled', 'active', 'excludedHosts'];
   const topOrigin = location.ancestorOrigins?.length
     ? location.ancestorOrigins[location.ancestorOrigins.length - 1]
     : location.origin;
 
   async function initialize() {
-    const revision = settingsRevision;
+    let revision = settingsRevision;
     try {
       const response = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS', topOrigin });
-      if (!response?.ok) return;
-      if (revision === settingsRevision) config = LinkNewTab.settings(response.settings);
-      else config = LinkNewTab.settings(await chrome.storage.local.get(LinkNewTab.defaults));
+      if (!response?.ok || !isActive()) return;
+      let stored = response.settings;
+      // If settings change while either read is pending, use a coherent latest
+      // snapshot before deciding whether the page needs a click listener.
+      while (revision !== settingsRevision) {
+        revision = settingsRevision;
+        stored = await chrome.storage.local.get(LinkNewTab.defaults);
+        if (!isActive()) return;
+      }
+      config = LinkNewTab.settings(stored);
       host = response.host;
       ready = true;
+      syncClickListener();
     } catch {
       // If Chrome has unloaded the extension, leave the page's native behavior alone.
+      isActive();
     }
   }
 
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'local') return;
+  function onSettingsChanged(changes, area) {
+    if (area !== 'local' || !linkSettingsKeys.some(key => key in changes) || !isActive()) return;
     settingsRevision++;
     const updated = { ...config };
-    for (const key of Object.keys(LinkNewTab.defaults)) {
+    for (const key of linkSettingsKeys) {
       if (key in changes) updated[key] = changes[key].newValue ?? LinkNewTab.defaults[key];
     }
     config = LinkNewTab.settings(updated);
-  });
+    syncClickListener();
+  }
+  chrome.storage.onChanged.addListener(onSettingsChanged);
+
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    ready = false;
+    if (clickListening) window.removeEventListener('click', onClick, true);
+    clickListening = false;
+    try { chrome.storage.onChanged.removeListener(onSettingsChanged); } catch { /* Already invalidated. */ }
+    notice?.remove();
+    notice = null;
+  }
+
+  function isActive() {
+    if (disposed) return false;
+    try { if (chrome.runtime?.id) return true; } catch { /* Invalidated extension world. */ }
+    dispose();
+    return false;
+  }
+
+  function syncClickListener() {
+    if (!isActive()) return;
+    const needed = ready && LinkNewTab.enabledOn(config, host);
+    if (needed === clickListening) return;
+    if (needed) window.addEventListener('click', onClick, { capture: true, passive: false });
+    else window.removeEventListener('click', onClick, true);
+    clickListening = needed;
+  }
 
   const actionRoles = new Set(['button', 'tab', 'checkbox', 'radio', 'switch', 'option']);
 
@@ -64,6 +105,7 @@
   }
 
   function showFailure(url) {
+    if (!isActive()) return;
     notice?.remove();
     notice = document.createElement('div');
     notice.setAttribute('data-link-new-tab-ignore', '');
@@ -88,8 +130,12 @@
     (document.body || document.documentElement).append(notice);
   }
 
-  window.addEventListener('click', event => {
-    if (!ready || !LinkNewTab.enabledOn(config, host) || !chrome.runtime?.id) return;
+  function onClick(event) {
+    if (!isActive()) return;
+    if (!ready || !LinkNewTab.enabledOn(config, host)) {
+      syncClickListener();
+      return;
+    }
     const url = destination(event);
     if (!url) return;
     let pending;
@@ -97,6 +143,7 @@
       pending = chrome.runtime.sendMessage({ type: 'OPEN_LINK', url, topOrigin });
     } catch {
       // A synchronous failure has not cancelled the original click.
+      isActive();
       return;
     }
     event.preventDefault();
@@ -104,7 +151,7 @@
     pending.then(response => {
       if (!response?.ok) showFailure(url);
     }, () => showFailure(url));
-  }, { capture: true, passive: false });
+  }
 
   void initialize();
 })();
